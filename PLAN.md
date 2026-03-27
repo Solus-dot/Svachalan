@@ -2,7 +2,7 @@
 
 ## Summary
 
-Build the project as a **Python** codebase with a **CLI plus library** interface and **local filesystem** artifact storage. The first goal is a thin but complete vertical slice: attach to an existing Chromium target over CDP, execute a validated YAML workflow, and emit a stable JSON run report with secret redaction and typed errors.
+Build the project as a **Python** codebase with a **CLI plus library** interface and **local filesystem** artifact storage. The first goal is a thin but complete vertical slice: launch a local Chromium instance, connect to it over CDP, execute a validated YAML workflow, and emit a stable JSON run report with secret redaction and typed errors. Attach mode should remain available as a secondary path.
 
 Implementation should proceed in phases that establish the contracts first, then the backend transport, then the runtime, then reporting and hardening. Because the repo currently contains only `TechSpec.md`, the first milestone includes bootstrapping the package structure and developer tooling.
 
@@ -14,6 +14,7 @@ Implementation should proceed in phases that establish the contracts first, then
 * Standardize on Python 3.12+, `uv`, `pytest`, and a `src/` layout.
 * Establish the initial package structure around:
   * `src/svachalan/contracts` for shared models and error types
+  * `src/svachalan/browser` for launch and attach lifecycle management
   * `src/svachalan/backend` for CDP transport and Chromium actions
   * `src/svachalan/runtime` for workflow execution
   * `src/svachalan/reporting` for artifacts and JSON reports
@@ -29,7 +30,12 @@ Implementation should proceed in phases that establish the contracts first, then
 
 ### 3. Build the CDP transport and backend primitives
 
-* Implement attach-only CDP connection logic to an existing Chromium websocket endpoint or target.
+* Implement browser lifecycle management for:
+  * launching a local Chromium or Chrome process
+  * allocating a debugging port
+  * creating a temporary profile directory
+  * waiting for the CDP endpoint and page target to become ready
+  * optionally attaching to an existing websocket endpoint or HTTP CDP endpoint
 * Build a page/session abstraction limited to one active page, the main frame plus one same-origin iframe hop, and fail-fast on popup/new-tab creation or unexpected target closure.
 * Implement backend methods in this order: `goto`, `wait_for`, `assert_exists`, `extract_text`, `extract_attr`, `click`, `type`, `screenshot`.
 * Lock backend semantics immediately around CSS selectors, unique matches, interactability, `domcontentloaded`, and `unsupported_scope`.
@@ -46,12 +52,18 @@ Implementation should proceed in phases that establish the contracts first, then
 * Create a local run-output directory layout for each execution.
 * Emit a stable JSON run report.
 * Enforce redaction centrally.
-* Implement a CLI command that loads a workflow, accepts existing CDP target details, executes the workflow, exits non-zero on failure, and prints the report path or concise JSON summary.
+* Implement a CLI command that loads a workflow, launches Chromium by default, executes the workflow, exits non-zero on failure, and prints the report path or concise JSON summary.
+* Support CLI browser options for:
+  * managed launch default behavior
+  * explicit browser binary path
+  * optional headless mode
+  * optional keep-browser-open behavior
+  * attach mode with existing CDP endpoint details
 
 ### 6. Harden with focused tests before expanding scope
 
 * Finish the MVP only after the full vertical slice works end to end.
-* Do not add multi-tab, popup handling beyond fail-fast detection, browser launch, or broader automation ergonomics before the v1 contracts are stable.
+* Do not add multi-tab, popup handling beyond fail-fast detection, or broader automation ergonomics before the v1 contracts are stable.
 * Expand only after core semantics are stable.
 
 ## Public APIs and Interfaces
@@ -59,11 +71,12 @@ Implementation should proceed in phases that establish the contracts first, then
 * Library surface:
   * `parse_workflow(source: str) -> WorkflowDocument`
   * `validate_workflow(doc: WorkflowDocument) -> ValidationResult`
+  * `start_browser_session(options: BrowserSessionOptions) -> BrowserSession`
   * `create_backend(config: BackendConfig) -> AutomationBackend`
   * `run_workflow(workflow: WorkflowDocument, backend: AutomationBackend, options: RunOptions) -> RunReport`
 * CLI surface:
-  * one command to execute a workflow against an existing CDP target
-  * explicit flags for workflow path, CDP endpoint/target, output directory, and optional secret injection
+  * one command to execute a workflow with managed launch by default
+  * explicit flags for workflow path, browser path, headless mode, keep-browser-open, output directory, optional attach endpoint/target, and optional secret injection
 * Data contracts:
   * versioned JSON run report schema
   * typed error object using the v1 `ErrorCode` taxonomy
@@ -73,9 +86,10 @@ Implementation should proceed in phases that establish the contracts first, then
 
 * Parser/validator tests for missing fields, bad namespaces, duplicate `save_as`, invalid retries, and frame configuration.
 * Backend tests for target attachment, frame resolution, selector errors, interactability, and unsupported scope.
+* Browser lifecycle tests for executable discovery, launch readiness, cleanup, and attach-mode resolution.
 * Runtime tests for interpolation, policy enforcement, retries, fail-fast behavior, and screenshot-on-failure behavior.
 * Reporting tests for redaction and stable typed report output.
-* End-to-end tests for a minimal login flow, a same-origin iframe extraction flow, and CLI/report behavior.
+* End-to-end tests for a minimal login flow, a same-origin iframe extraction flow, and CLI/report behavior in both launch and attach modes.
 
 ## Assumptions and Defaults
 
@@ -84,6 +98,6 @@ Implementation should proceed in phases that establish the contracts first, then
 * Test framework: `pytest`
 * Primary entrypoint: CLI plus library
 * Artifact storage: local filesystem
-* Browser lifecycle: attach-only
+* Browser lifecycle: launch-and-attach, with managed launch as the default path
 * Runtime scope: one active page with explicit same-origin iframe targeting only
 * Initial implementation prioritizes the end-to-end vertical slice over extra abstractions

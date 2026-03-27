@@ -14,7 +14,8 @@ The system is intended to be deterministic, auditable, and suitable as an execut
 
 ### In scope for v1
 
-* Attach to and control an existing Chromium-based browser via CDP.
+* Launch and control a local Chromium-based browser via CDP.
+* Optionally attach to an existing Chromium-based browser via CDP.
 * Execute low-level browser actions such as navigation, click, type, wait, extract, assert, and screenshot.
 * Run a compact YAML workflow format with strict validation.
 * Support namespaced runtime inputs, secret inputs, and extracted outputs.
@@ -24,7 +25,6 @@ The system is intended to be deterministic, auditable, and suitable as an execut
 
 ### Out of scope for v1
 
-* Launching or managing the browser process.
 * Firefox or WebKit support.
 * Multiple tabs, popups, or multi-page workflows.
 * Cross-origin iframe automation.
@@ -35,7 +35,7 @@ The system is intended to be deterministic, auditable, and suitable as an execut
 
 ## Architecture
 
-The system has five core components:
+The system has six core components:
 
 1. **YAML parser and validator**
 
@@ -54,12 +54,19 @@ The system has five core components:
    * maps workflow actions to backend primitives
    * converts backend results into normalized step results
 
-4. **Chromium backend**
+4. **Browser lifecycle manager**
 
-   * attaches to an existing Chromium target over CDP
+   * launches a local Chromium process when managed mode is used
+   * allocates a debugging port and temporary profile
+   * resolves the CDP endpoint and target information
+   * tears down the managed browser process unless configured otherwise
+
+5. **Chromium backend**
+
+   * attaches to a launched or existing Chromium target over CDP
    * owns navigation, frame lookup, DOM lookup, JS evaluation, input dispatch, and screenshots
 
-5. **Artifact and reporting layer**
+6. **Artifact and reporting layer**
 
    * stores logs, screenshots, and final run reports
    * applies redaction rules before persisting step or run data
@@ -67,7 +74,7 @@ The system has five core components:
 Conceptually:
 
 ```text
-YAML workflow → parser/validator → runtime → action dispatcher → Chromium backend → browser
+YAML workflow → parser/validator → runtime → action dispatcher → browser lifecycle manager → Chromium backend → browser
 ```
 
 ## Workflow Schema
@@ -135,6 +142,8 @@ steps:
 * `allowed_domains` optional; allowlist applied to top-level and targeted frame navigations
 * `screenshot_on_failure` optional; captures a failure artifact when a step fails
 * `goto_wait_until` optional; defaults to `domcontentloaded`
+
+Browser launch and attachment settings are not part of the workflow document in v1. They are supplied by the CLI or embedding application so the same workflow can run in either managed-launch or attach mode.
 
 ### Variable namespaces
 
@@ -227,6 +236,7 @@ The runtime maintains:
 
 * current step index
 * run status
+* browser session mode
 * immutable `vars`
 * immutable `secrets`
 * mutable `outputs`
@@ -289,13 +299,28 @@ The runtime also fails immediately if:
 * the controlled target closes unexpectedly
 * a cross-origin frame is targeted
 
+### Browser startup modes
+
+v1 supports two browser session modes:
+
+* `launch`
+  * the system starts a local Chromium or Chrome process
+  * the system creates a temporary profile directory by default
+  * the system allocates a debugging port and waits for the CDP endpoint to become ready
+  * the system tears the browser down after the run unless explicitly configured to keep it open
+* `attach`
+  * the system connects to an already-running Chromium instance or target
+  * browser process lifecycle remains outside the automation run
+
+For v1, managed launch should be the default CLI path. Attach mode remains available for advanced users and integration environments.
+
 ## Backend Design
 
 The backend is Chromium-first and communicates directly with the browser using CDP.
 
 ### Backend responsibilities
 
-* attach to an existing Chromium instance or target
+* attach to a launched or existing Chromium instance or target
 * manage one active page session
 * resolve main-frame and same-origin iframe targets
 * navigate to URLs
@@ -306,6 +331,24 @@ The backend is Chromium-first and communicates directly with the browser using C
 * wait for selector presence
 * capture screenshots
 * surface typed errors and artifact references
+
+### Browser lifecycle responsibilities
+
+The browser lifecycle manager owns:
+
+* locating a Chromium or Chrome executable
+* spawning the browser process with the required remote debugging flags
+* selecting a debugging port
+* creating and cleaning up a temporary user-data-dir
+* waiting for the local CDP HTTP endpoint to expose a debuggable page target
+* optionally preserving the browser process or profile if requested by the caller
+
+For v1:
+
+* managed launch is local-only
+* headed mode is the default
+* one browser process and one active page are managed per run
+* popup and multi-tab workflows remain unsupported even in managed mode
 
 ### CDP domains used initially
 
@@ -325,6 +368,27 @@ Conceptual interface:
 
 ```ts
 type WaitUntil = "domcontentloaded";
+
+type BrowserSessionMode = "launch" | "attach";
+
+interface LaunchOptions {
+  browserPath?: string;
+  headless?: boolean;
+  keepBrowserOpen?: boolean;
+  userDataDir?: string;
+  debuggingPort?: number;
+}
+
+interface AttachOptions {
+  endpoint: string;
+  targetId?: string;
+}
+
+interface BrowserSessionOptions {
+  mode: BrowserSessionMode;
+  launch?: LaunchOptions;
+  attach?: AttachOptions;
+}
 
 interface ElementTarget {
   selector: string;
@@ -368,6 +432,16 @@ interface ActionResult<T> {
   artifacts?: ArtifactRef[];
 }
 
+interface BrowserSession {
+  mode: BrowserSessionMode;
+  wsEndpoint: string;
+  cleanup(): Promise<void>;
+}
+
+interface BrowserLifecycleManager {
+  startSession(options: BrowserSessionOptions): Promise<BrowserSession>;
+}
+
 interface AutomationBackend {
   goto(url: string, opts?: NavigationOptions): Promise<ActionResult<void>>;
   click(target: ElementTarget, opts?: ActionOptions): Promise<ActionResult<void>>;
@@ -380,7 +454,7 @@ interface AutomationBackend {
 }
 ```
 
-This keeps the workflow runtime independent of backend implementation details while making frame targeting, navigation behavior, and typed errors explicit.
+This keeps the workflow runtime independent of backend implementation details while making browser lifecycle, frame targeting, navigation behavior, and typed errors explicit.
 
 ## Logging and Reporting
 
@@ -434,7 +508,8 @@ Step results and final reports must use these error codes:
 
 The MVP is complete when the system can:
 
-* attach to Chromium over CDP without launching the browser
+* launch a local Chromium instance and connect to it over CDP
+* optionally attach to an existing Chromium instance over CDP
 * execute `goto`, `type`, `click`, `wait_for`, and `extract_text` on the main frame
 * execute DOM-targeting actions within explicitly targeted same-origin iframes
 * support namespaced interpolation for `vars`, `secrets`, and `outputs`
@@ -466,16 +541,18 @@ Scope behavior should verify:
 
 * popup or new-tab creation fails fast with `unsupported_scope`
 * unexpected target closure fails cleanly
-* attach-only startup is the only supported browser lifecycle in v1
+* managed launch starts Chromium, waits for CDP readiness, and tears the process down cleanly by default
+* attach mode remains supported for existing browser sessions
 
 ## Recommended Build Order
 
-1. implement CDP transport and attach-only page/session management
-2. implement backend primitives for navigation, frame resolution, DOM lookup, click, type, wait, extract, assert, and screenshot
-3. implement workflow parsing, validation, interpolation, and runtime state management
-4. add structured reporting, error taxonomy, redaction, and failure artifacts
-5. extend only after the core action semantics are stable
+1. implement browser lifecycle management for managed launch, executable discovery, debugging port allocation, and optional attach mode
+2. implement CDP transport and page/session management
+3. implement backend primitives for navigation, frame resolution, DOM lookup, click, type, wait, extract, assert, and screenshot
+4. implement workflow parsing, validation, interpolation, and runtime state management
+5. add structured reporting, error taxonomy, redaction, and failure artifacts
+6. extend only after the core action semantics are stable
 
 ## Summary
 
-The core idea is to treat browser automation as a deterministic execution system rather than a scripting convenience layer. The backend owns browser control, the runtime owns step semantics, and the YAML DSL stays compact and strictly constrained. In v1, the system favors explicit scope limits, typed errors, and sanitized reporting so that automation runs are predictable, auditable, and safe to consume from higher-level agents.
+The core idea is to treat browser automation as a deterministic execution system rather than a scripting convenience layer. The browser lifecycle manager owns launch or attach behavior, the backend owns browser control, the runtime owns step semantics, and the YAML DSL stays compact and strictly constrained. In v1, the system favors explicit scope limits, typed errors, and sanitized reporting so that automation runs are predictable, auditable, and safe to consume from higher-level agents.
