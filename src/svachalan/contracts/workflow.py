@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from svachalan.contracts.backend import WaitUntil
+from svachalan.contracts.backend import ElementMatch, WaitUntil
 
 ALLOWED_ACTIONS = {
     "goto",
@@ -52,7 +52,9 @@ class WorkflowStep(BaseModel):
     timeout_ms: int | None = None
     retry_count: int | None = None
     selector: str | None = None
+    selectors: list[str] | None = None
     frame_selector: str | None = None
+    match: ElementMatch | None = None
     text: str | None = None
     url: str | None = None
     save_as: str | None = None
@@ -67,4 +69,3 @@ class WorkflowDocument(BaseModel):
     vars: dict[str, Any] = Field(default_factory=dict)
     secrets: dict[str, Any] = Field(default_factory=dict)
     steps: list[WorkflowStep]
-

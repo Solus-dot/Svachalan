@@ -18,6 +18,11 @@ class BrowserSessionMode(StrEnum):
     ATTACH = "attach"
 
 
+class ElementMatch(StrEnum):
+    UNIQUE = "unique"
+    FIRST_VISIBLE = "first_visible"
+
+
 class LaunchOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -82,8 +87,17 @@ class ArtifactRef(BaseModel):
 class ElementTarget(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    selector: str
+    selector: str | None = None
+    selectors: list[str] = Field(default_factory=list)
     frame_selector: str | None = None
+    match: ElementMatch = ElementMatch.UNIQUE
+
+    def all_selectors(self) -> list[str]:
+        selectors: list[str] = []
+        if self.selector is not None:
+            selectors.append(self.selector)
+        selectors.extend(self.selectors)
+        return selectors
 
 
 class ActionOptions(BaseModel):

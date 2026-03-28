@@ -18,34 +18,56 @@ from svachalan.contracts.workflow import (
 _INTERPOLATION_TOKEN = re.compile(r"\$\{([^}]+)\}")
 _ACTION_REQUIRED_FIELDS = {
     "goto": {"url"},
-    "click": {"selector"},
-    "type": {"selector", "text"},
-    "wait_for": {"selector"},
-    "extract_text": {"selector", "save_as"},
-    "extract_attr": {"selector", "attr", "save_as"},
-    "assert_exists": {"selector"},
+    "click": set(),
+    "type": {"text"},
+    "wait_for": set(),
+    "extract_text": {"save_as"},
+    "extract_attr": {"attr", "save_as"},
+    "assert_exists": set(),
     "screenshot": set(),
 }
 _ACTION_ALLOWED_FIELDS = {
     "goto": {"id", "action", "timeout_ms", "retry_count", "url"},
-    "click": {"id", "action", "timeout_ms", "retry_count", "selector", "frame_selector"},
+    "click": {
+        "id",
+        "action",
+        "timeout_ms",
+        "retry_count",
+        "selector",
+        "selectors",
+        "frame_selector",
+        "match",
+    },
     "type": {
         "id",
         "action",
         "timeout_ms",
         "retry_count",
         "selector",
+        "selectors",
         "frame_selector",
+        "match",
         "text",
     },
-    "wait_for": {"id", "action", "timeout_ms", "retry_count", "selector", "frame_selector"},
+    "wait_for": {
+        "id",
+        "action",
+        "timeout_ms",
+        "retry_count",
+        "selector",
+        "selectors",
+        "frame_selector",
+        "match",
+    },
     "extract_text": {
         "id",
         "action",
         "timeout_ms",
         "retry_count",
         "selector",
+        "selectors",
         "frame_selector",
+        "match",
         "save_as",
     },
     "extract_attr": {
@@ -54,11 +76,22 @@ _ACTION_ALLOWED_FIELDS = {
         "timeout_ms",
         "retry_count",
         "selector",
+        "selectors",
         "frame_selector",
+        "match",
         "save_as",
         "attr",
     },
-    "assert_exists": {"id", "action", "timeout_ms", "retry_count", "selector", "frame_selector"},
+    "assert_exists": {
+        "id",
+        "action",
+        "timeout_ms",
+        "retry_count",
+        "selector",
+        "selectors",
+        "frame_selector",
+        "match",
+    },
     "screenshot": {"id", "action", "timeout_ms", "retry_count"},
 }
 _STEP_FIELDS_TO_SCAN = ("selector", "frame_selector", "text", "url", "save_as", "attr")
@@ -206,6 +239,9 @@ def _validate_step(
             )
         )
 
+    if step.action in DOM_ACTIONS:
+        issues.extend(_validate_locator_fields(step, path))
+
     for field_name in _STEP_FIELDS_TO_SCAN:
         value = getattr(step, field_name)
         if isinstance(value, str):
@@ -213,6 +249,15 @@ def _validate_step(
                 _validate_interpolation(
                     value,
                     f"{path}.{field_name}",
+                    available_outputs=available_outputs,
+                )
+            )
+    if step.selectors is not None:
+        for selector_index, selector in enumerate(step.selectors):
+            issues.extend(
+                _validate_interpolation(
+                    selector,
+                    f"{path}.selectors[{selector_index}]",
                     available_outputs=available_outputs,
                 )
             )
@@ -227,6 +272,39 @@ def _validate_step(
             )
         declared_output_keys.add(step.save_as)
         available_outputs.add(step.save_as)
+
+    return issues
+
+
+def _validate_locator_fields(step: WorkflowStep, path: str) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    has_selector = step.selector not in (None, "")
+    has_selectors = step.selectors is not None and len(step.selectors) > 0
+
+    if not has_selector and not has_selectors:
+        issues.append(
+            ValidationIssue(
+                path=f"{path}.selector",
+                message="At least one selector is required.",
+            )
+        )
+
+    if step.selectors is not None:
+        if not step.selectors:
+            issues.append(
+                ValidationIssue(
+                    path=f"{path}.selectors",
+                    message="selectors cannot be empty when provided.",
+                )
+            )
+        for selector_index, selector in enumerate(step.selectors):
+            if selector == "":
+                issues.append(
+                    ValidationIssue(
+                        path=f"{path}.selectors[{selector_index}]",
+                        message="selectors entries cannot be empty.",
+                    )
+                )
 
     return issues
 

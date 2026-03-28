@@ -12,6 +12,7 @@ from svachalan.contracts.backend import (
     ActionResult,
     ArtifactRef,
     AutomationBackend,
+    ElementMatch,
     ElementTarget,
     NavigationOptions,
     ScreenshotOptions,
@@ -184,8 +185,10 @@ def _dispatch_step(
         return backend.screenshot(ScreenshotOptions(timeout_ms=timeout_ms, step_id=step.id))
 
     target = ElementTarget(
-        selector=resolved_inputs["selector"],
+        selector=resolved_inputs.get("selector"),
+        selectors=resolved_inputs.get("selectors", []),
         frame_selector=resolved_inputs.get("frame_selector"),
+        match=step.match or ElementMatch.UNIQUE,
     )
     if step.action == "click":
         return backend.click(target, common_options)
@@ -228,6 +231,17 @@ def _resolve_step_inputs(
         resolved_value = _interpolate(raw_value, vars_context, secrets_context, outputs_context)
         resolved_inputs[field_name] = resolved_value
         sanitized_inputs[field_name] = _sanitize_interpolated_value(raw_value, resolved_value)
+
+    if step.selectors is not None:
+        resolved_selectors = [
+            _interpolate(value, vars_context, secrets_context, outputs_context)
+            for value in step.selectors
+        ]
+        resolved_inputs["selectors"] = resolved_selectors
+        sanitized_inputs["selectors"] = [
+            _sanitize_interpolated_value(raw_value, resolved_value)
+            for raw_value, resolved_value in zip(step.selectors, resolved_selectors, strict=True)
+        ]
 
     return sanitized_inputs, resolved_inputs
 

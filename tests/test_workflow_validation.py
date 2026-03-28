@@ -76,3 +76,37 @@ steps:
         issue.path == "steps[0].text" and "previous step" in issue.message
         for issue in result.issues
     )
+
+
+def test_validate_workflow_accepts_fallback_selectors_with_match() -> None:
+    workflow = parse_workflow(
+        """
+version: 1
+steps:
+  - action: click
+    selectors:
+      - ".missing"
+      - "button.primary"
+    match: first_visible
+"""
+    )
+
+    result = validate_workflow(workflow)
+
+    assert result.ok is True
+
+
+def test_validate_workflow_rejects_empty_selectors_list() -> None:
+    workflow = parse_workflow(
+        """
+version: 1
+steps:
+  - action: wait_for
+    selectors: []
+"""
+    )
+
+    result = validate_workflow(workflow)
+
+    assert result.ok is False
+    assert any(issue.path == "steps[0].selectors" for issue in result.issues)

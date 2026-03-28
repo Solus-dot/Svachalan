@@ -7,6 +7,7 @@ from svachalan.contracts import (
     ActionError,
     ActionResult,
     ArtifactRef,
+    ElementMatch,
     ElementTarget,
     ErrorCode,
     RunOptions,
@@ -16,6 +17,7 @@ from svachalan.contracts import (
 class FakeBackend:
     def __init__(self) -> None:
         self.extract_text_results: deque[ActionResult] = deque()
+        self.click_calls: list[ElementTarget] = []
         self.type_calls: list[tuple[ElementTarget, str]] = []
         self.wait_for_results: deque[ActionResult] = deque()
         self.screenshot_calls = 0
@@ -24,6 +26,7 @@ class FakeBackend:
         return ActionResult.success()
 
     def click(self, target: ElementTarget, opts=None) -> ActionResult:
+        self.click_calls.append(target)
         return ActionResult.success()
 
     def type(self, target: ElementTarget, text: str, opts=None) -> ActionResult:
@@ -148,3 +151,27 @@ steps:
     assert report.status.value == "succeeded"
     assert report.steps[0].artifacts[0].path.endswith(".png")
     assert report.artifacts[0].path.endswith(".png")
+
+
+def test_run_workflow_passes_fallback_selectors_and_match_to_backend() -> None:
+    workflow = parse_workflow(
+        """
+version: 1
+steps:
+  - id: click-primary
+    action: click
+    selectors:
+      - ".missing-button"
+      - "button.primary"
+    match: first_visible
+"""
+    )
+    backend = FakeBackend()
+
+    report = run_workflow(workflow, backend, RunOptions())
+
+    assert report.status.value == "succeeded"
+    assert len(backend.click_calls) == 1
+    assert backend.click_calls[0].selector is None
+    assert backend.click_calls[0].selectors == [".missing-button", "button.primary"]
+    assert backend.click_calls[0].match == ElementMatch.FIRST_VISIBLE

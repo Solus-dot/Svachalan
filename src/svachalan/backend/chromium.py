@@ -77,7 +77,7 @@ class ChromiumBackend:
             return result
         return _failure(
             ErrorCode.TIMEOUT,
-            f"Timed out waiting for selector {target.selector!r}.",
+            f"Timed out waiting for target {_target_description(target)!r}.",
         )
 
     def assert_exists(
@@ -265,8 +265,9 @@ def _build_dom_expression(
 ) -> str:
     payload = json.dumps(
         {
-            "selector": target.selector,
+            "selectors": target.all_selectors(),
             "frameSelector": target.frame_selector,
+            "match": target.match,
             "action": action,
             "text": text,
             "attr": attr,
@@ -307,15 +308,35 @@ def _build_dom_expression(
     }}
   }};
 
+  const describeSelectors = () => args.selectors.join(", ");
+
   const resolveElement = (root) => {{
-    const matches = root.querySelectorAll(args.selector);
-    if (matches.length === 0) {{
-      return fail("selector_not_found", `Selector ${{args.selector}} was not found.`);
+    let nonUniqueSelector = null;
+    for (const selector of args.selectors) {{
+      const matches = Array.from(root.querySelectorAll(selector));
+      if (matches.length === 0) {{
+        continue;
+      }}
+      if (args.match === "first_visible") {{
+        const visibleMatch = matches.find((match) => isVisible(match));
+        if (visibleMatch) {{
+          return {{ element: visibleMatch, selector }};
+        }}
+        continue;
+      }}
+      if (matches.length > 1) {{
+        nonUniqueSelector = selector;
+        continue;
+      }}
+      return {{ element: matches[0], selector }};
     }}
-    if (matches.length > 1) {{
-      return fail("selector_not_unique", `Selector ${{args.selector}} matched multiple elements.`);
+    if (nonUniqueSelector) {{
+      return fail(
+        "selector_not_unique",
+        `Selector ${{nonUniqueSelector}} matched multiple elements.`,
+      );
     }}
-    return {{ element: matches[0] }};
+    return fail("selector_not_found", `No selectors matched: ${{describeSelectors()}}.`);
   }};
 
   const isVisible = (element) => {{
@@ -342,6 +363,7 @@ def _build_dom_expression(
   }}
 
   const element = elementResult.element;
+  const matchedSelector = elementResult.selector;
   if (args.action === "exists") {{
     return succeed();
   }}
@@ -356,7 +378,7 @@ def _build_dom_expression(
     return succeed(element.getAttribute(args.attr));
   }}
   if (!isVisible(element) || !isEnabled(element)) {{
-    return fail("element_not_interactable", `Selector ${{args.selector}} is not interactable.`);
+    return fail("element_not_interactable", `Selector ${{matchedSelector}} is not interactable.`);
   }}
   if (args.action === "click") {{
     element.click();
@@ -378,7 +400,7 @@ def _build_dom_expression(
     }}
     return fail(
       "element_not_interactable",
-      `Selector ${{args.selector}} is not a typable element.`,
+      `Selector ${{matchedSelector}} is not a typable element.`,
     );
   }}
   return fail("protocol_error", `Unsupported DOM action ${{args.action}}.`);
@@ -388,6 +410,10 @@ def _build_dom_expression(
 
 def _failure(code: ErrorCode, message: str) -> ActionResult:
     return ActionResult.failure(ActionError(code=code, message=message))
+
+
+def _target_description(target: ElementTarget) -> str:
+    return ", ".join(target.all_selectors())
 
 
 def _timeout_seconds(opts: ActionOptions | None) -> float:

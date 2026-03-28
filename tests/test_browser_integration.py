@@ -36,6 +36,26 @@ class _TestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.path == "/locator.html":
+            self._send_html(
+                """
+<!doctype html>
+<html>
+  <body>
+    <button class="action" style="display:none">Hidden Action</button>
+    <button class="action" id="visible-action">Visible Action</button>
+    <div id="result"></div>
+    <script>
+      document.querySelector("#visible-action").addEventListener("click", () => {
+        document.querySelector("#result").textContent = "clicked visible action";
+      });
+    </script>
+  </body>
+</html>
+"""
+            )
+            return
+
         self._send_html(
             """
 <!doctype html>
@@ -223,3 +243,54 @@ def test_chromium_backend_screenshot_allows_default_options(
     assert result.value is not None
     assert result.value.label == "screenshot"
     assert Path(result.value.path).exists()
+
+
+def test_browser_backend_supports_fallback_selectors_and_first_visible_matching() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _TestHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    workflow = parse_workflow(
+        f"""
+version: 1
+settings:
+  allowed_domains: ["127.0.0.1"]
+steps:
+  - action: goto
+    url: "http://127.0.0.1:{server.server_address[1]}/locator.html"
+  - action: click
+    selectors:
+      - ".missing-action"
+      - "button.action"
+    match: first_visible
+  - action: wait_for
+    selector: "#result"
+  - action: extract_text
+    selector: "#result"
+    save_as: result_text
+"""
+    )
+
+    session = None
+    backend = None
+    try:
+        try:
+            session = start_browser_session(
+                BrowserSessionOptions(launch=LaunchOptions(headless=True))
+            )
+        except FileNotFoundError as exc:
+            pytest.skip(str(exc))
+
+        backend = create_backend(BackendConfig(session=session))
+        report = run_workflow(workflow, backend, RunOptions())
+    finally:
+        if backend is not None and hasattr(backend, "close"):
+            backend.close()
+        if session is not None:
+            session.cleanup()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert report.status.value == "succeeded"
+    assert report.outputs["result_text"] == "clicked visible action"
