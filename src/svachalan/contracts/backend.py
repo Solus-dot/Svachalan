@@ -82,6 +82,20 @@ class ArtifactRef(BaseModel):
     path: str
     kind: str = "file"
     label: str | None = None
+    contents: str | None = None
+    mime_type: str | None = None
+
+
+class PageState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str | None = None
+    title: str | None = None
+    html: str | None = None
+    text: str | None = None
+    handoff_required: bool = False
+    handoff_reason: str | None = None
+    detected_indicators: list[str] = Field(default_factory=list)
 
 
 class ElementTarget(BaseModel):
@@ -91,6 +105,7 @@ class ElementTarget(BaseModel):
     selectors: list[str] = Field(default_factory=list)
     frame_selector: str | None = None
     match: ElementMatch = ElementMatch.UNIQUE
+    within: ElementTarget | None = None
 
     def all_selectors(self) -> list[str]:
         selectors: list[str] = []
@@ -126,6 +141,7 @@ class ActionResult(BaseModel):
     value: Any | None = None
     error: ActionError | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod
     def success(
@@ -133,8 +149,9 @@ class ActionResult(BaseModel):
         value: Any = None,
         *,
         artifacts: list[ArtifactRef] | None = None,
+        details: dict[str, Any] | None = None,
     ) -> ActionResult:
-        return cls(ok=True, value=value, artifacts=artifacts or [])
+        return cls(ok=True, value=value, artifacts=artifacts or [], details=details or {})
 
     @classmethod
     def failure(
@@ -142,8 +159,14 @@ class ActionResult(BaseModel):
         error: ActionError,
         *,
         artifacts: list[ArtifactRef] | None = None,
+        details: dict[str, Any] | None = None,
     ) -> ActionResult:
-        return cls(ok=False, error=error, artifacts=artifacts or [])
+        return cls(
+            ok=False,
+            error=error,
+            artifacts=artifacts or [],
+            details=details or {},
+        )
 
 
 @runtime_checkable
@@ -185,3 +208,8 @@ class AutomationBackend(Protocol):
     ) -> ActionResult: ...
 
     def screenshot(self, opts: ScreenshotOptions | None = None) -> ActionResult: ...
+
+    def inspect_page(self, opts: ActionOptions | None = None) -> ActionResult: ...
+
+
+ElementTarget.model_rebuild()

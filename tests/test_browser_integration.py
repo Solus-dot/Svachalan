@@ -56,6 +56,110 @@ class _TestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.path == "/scoped.html":
+            self._send_html(
+                """
+<!doctype html>
+<html>
+  <body>
+    <div id="card-1" class="card">
+      <button class="action">Wrong Action</button>
+    </div>
+    <div id="card-2" class="card">
+      <button class="action" id="target-action">Target Action</button>
+    </div>
+    <div id="result"></div>
+    <script>
+      document.querySelector("#target-action").addEventListener("click", () => {
+        document.querySelector("#result").textContent = "scoped click succeeded";
+      });
+    </script>
+  </body>
+</html>
+"""
+            )
+            return
+
+        if self.path == "/challenge.html":
+            self._send_html(
+                """
+<!doctype html>
+<html>
+  <head>
+    <title>Security Check</title>
+  </head>
+  <body>
+    <h1>Security Check</h1>
+    <p>Verify you are human before continuing.</p>
+    <input type="password" />
+  </body>
+</html>
+"""
+            )
+            return
+
+        if self.path == "/admin.html":
+            self._send_html(
+                """
+<!doctype html>
+<html>
+  <body>
+    <form action="/admin-saved.html" method="get">
+      <label for="setting">Setting</label>
+      <input id="setting" name="setting" />
+      <button id="save-settings" type="submit">Save settings</button>
+    </form>
+  </body>
+</html>
+"""
+            )
+            return
+
+        if self.path.startswith("/admin-saved.html"):
+            self._send_html(
+                """
+<!doctype html>
+<html>
+  <body>
+    <h1>Settings</h1>
+    <div id="status">Saved successfully</div>
+  </body>
+</html>
+"""
+            )
+            return
+
+        if self.path == "/catalog.html":
+            self._send_html(
+                """
+<!doctype html>
+<html>
+  <body>
+    <div class="product-card" data-sku="widget-2">
+      <h2 class="product-name">Portable Widget</h2>
+      <a class="details-link" href="/products/widget-2.html">View details</a>
+    </div>
+  </body>
+</html>
+"""
+            )
+            return
+
+        if self.path == "/products/widget-2.html":
+            self._send_html(
+                """
+<!doctype html>
+<html>
+  <body>
+    <h1 id="product-title">Portable Widget</h1>
+    <div id="product-price">$19.99</div>
+    <div id="product-stock">In stock</div>
+  </body>
+</html>
+"""
+            )
+            return
+
         self._send_html(
             """
 <!doctype html>
@@ -294,3 +398,207 @@ steps:
 
     assert report.status.value == "succeeded"
     assert report.outputs["result_text"] == "clicked visible action"
+
+
+def test_browser_backend_supports_within_scoping() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _TestHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    workflow = parse_workflow(
+        f"""
+version: 1
+settings:
+  allowed_domains: ["127.0.0.1"]
+steps:
+  - action: goto
+    url: "http://127.0.0.1:{server.server_address[1]}/scoped.html"
+  - action: click
+    selector: ".action"
+    within:
+      selector: "#card-2"
+  - action: extract_text
+    selector: "#result"
+    save_as: result_text
+"""
+    )
+
+    session = None
+    backend = None
+    try:
+        try:
+            session = start_browser_session(
+                BrowserSessionOptions(launch=LaunchOptions(headless=True))
+            )
+        except FileNotFoundError as exc:
+            pytest.skip(str(exc))
+
+        backend = create_backend(BackendConfig(session=session))
+        report = run_workflow(workflow, backend, RunOptions())
+    finally:
+        if backend is not None and hasattr(backend, "close"):
+            backend.close()
+        if session is not None:
+            session.cleanup()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert report.status.value == "succeeded"
+    assert report.outputs["result_text"] == "scoped click succeeded"
+
+
+def test_browser_backend_reports_handoff_for_challenge_page() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _TestHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    workflow = parse_workflow(
+        f"""
+version: 1
+settings:
+  allowed_domains: ["127.0.0.1"]
+steps:
+  - action: goto
+    url: "http://127.0.0.1:{server.server_address[1]}/challenge.html"
+  - action: wait_for
+    selector: "#never-appears"
+"""
+    )
+
+    session = None
+    backend = None
+    try:
+        try:
+            session = start_browser_session(
+                BrowserSessionOptions(launch=LaunchOptions(headless=True))
+            )
+        except FileNotFoundError as exc:
+            pytest.skip(str(exc))
+
+        backend = create_backend(BackendConfig(session=session))
+        report = run_workflow(workflow, backend, RunOptions())
+    finally:
+        if backend is not None and hasattr(backend, "close"):
+            backend.close()
+        if session is not None:
+            session.cleanup()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert report.status.value == "failed"
+    assert report.handoff_required is True
+    assert report.error is not None
+    assert report.error.code.value == "human_handoff_required"
+
+
+def test_browser_backend_supports_admin_style_url_and_text_assertions() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _TestHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    workflow = parse_workflow(
+        f"""
+version: 1
+settings:
+  allowed_domains: ["127.0.0.1"]
+steps:
+  - action: goto
+    url: "http://127.0.0.1:{server.server_address[1]}/admin.html"
+  - action: type
+    selector: "#setting"
+    text: "enabled"
+  - action: click
+    selector: "#save-settings"
+  - action: wait_for_url_contains
+    url: "/admin-saved.html"
+  - action: assert_url_contains
+    url: "/admin-saved.html"
+  - action: assert_text_contains
+    selector: "#status"
+    text: "Saved"
+"""
+    )
+
+    session = None
+    backend = None
+    try:
+        try:
+            session = start_browser_session(
+                BrowserSessionOptions(launch=LaunchOptions(headless=True))
+            )
+        except FileNotFoundError as exc:
+            pytest.skip(str(exc))
+
+        backend = create_backend(BackendConfig(session=session))
+        report = run_workflow(workflow, backend, RunOptions())
+    finally:
+        if backend is not None and hasattr(backend, "close"):
+            backend.close()
+        if session is not None:
+            session.cleanup()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert report.status.value == "succeeded"
+    assert report.steps[3].action == "wait_for_url_contains"
+    assert report.steps[5].action == "assert_text_contains"
+
+
+def test_browser_backend_supports_multi_page_extraction_flow() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _TestHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    workflow = parse_workflow(
+        f"""
+version: 1
+settings:
+  allowed_domains: ["127.0.0.1"]
+steps:
+  - action: goto
+    url: "http://127.0.0.1:{server.server_address[1]}/catalog.html"
+  - action: click
+    selector: ".details-link"
+    within:
+      selector: ".product-card[data-sku='widget-2']"
+  - action: wait_for_url_contains
+    url: "/products/widget-2.html"
+  - action: extract_text
+    selector: "#product-title"
+    save_as: product_title
+  - action: extract_text
+    selector: "#product-price"
+    save_as: product_price
+  - action: assert_text_contains
+    selector: "#product-stock"
+    text: "In stock"
+"""
+    )
+
+    session = None
+    backend = None
+    try:
+        try:
+            session = start_browser_session(
+                BrowserSessionOptions(launch=LaunchOptions(headless=True))
+            )
+        except FileNotFoundError as exc:
+            pytest.skip(str(exc))
+
+        backend = create_backend(BackendConfig(session=session))
+        report = run_workflow(workflow, backend, RunOptions())
+    finally:
+        if backend is not None and hasattr(backend, "close"):
+            backend.close()
+        if session is not None:
+            session.cleanup()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert report.status.value == "succeeded"
+    assert report.outputs["product_title"] == "Portable Widget"
+    assert report.outputs["product_price"] == "$19.99"

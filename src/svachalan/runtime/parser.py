@@ -11,19 +11,27 @@ from svachalan.contracts.workflow import (
     ALLOWED_ACTIONS,
     DOM_ACTIONS,
     READ_ONLY_ACTIONS,
+    WorkflowBranch,
     WorkflowDocument,
+    WorkflowLocator,
     WorkflowStep,
 )
 
 _INTERPOLATION_TOKEN = re.compile(r"\$\{([^}]+)\}")
+_LOCATOR_ACTIONS = DOM_ACTIONS | {"if_exists"}
 _ACTION_REQUIRED_FIELDS = {
     "goto": {"url"},
     "click": set(),
     "type": {"text"},
     "wait_for": set(),
+    "wait_for_url_contains": {"url"},
     "extract_text": {"save_as"},
     "extract_attr": {"attr", "save_as"},
     "assert_exists": set(),
+    "assert_url_contains": {"url"},
+    "assert_text_contains": {"text"},
+    "if_exists": {"then_steps"},
+    "one_of": {"branches"},
     "screenshot": set(),
 }
 _ACTION_ALLOWED_FIELDS = {
@@ -37,6 +45,7 @@ _ACTION_ALLOWED_FIELDS = {
         "selectors",
         "frame_selector",
         "match",
+        "within",
     },
     "type": {
         "id",
@@ -48,6 +57,7 @@ _ACTION_ALLOWED_FIELDS = {
         "frame_selector",
         "match",
         "text",
+        "within",
     },
     "wait_for": {
         "id",
@@ -58,7 +68,9 @@ _ACTION_ALLOWED_FIELDS = {
         "selectors",
         "frame_selector",
         "match",
+        "within",
     },
+    "wait_for_url_contains": {"id", "action", "timeout_ms", "retry_count", "url"},
     "extract_text": {
         "id",
         "action",
@@ -68,6 +80,7 @@ _ACTION_ALLOWED_FIELDS = {
         "selectors",
         "frame_selector",
         "match",
+        "within",
         "save_as",
     },
     "extract_attr": {
@@ -79,6 +92,7 @@ _ACTION_ALLOWED_FIELDS = {
         "selectors",
         "frame_selector",
         "match",
+        "within",
         "save_as",
         "attr",
     },
@@ -91,7 +105,35 @@ _ACTION_ALLOWED_FIELDS = {
         "selectors",
         "frame_selector",
         "match",
+        "within",
     },
+    "assert_url_contains": {"id", "action", "timeout_ms", "retry_count", "url"},
+    "assert_text_contains": {
+        "id",
+        "action",
+        "timeout_ms",
+        "retry_count",
+        "selector",
+        "selectors",
+        "frame_selector",
+        "match",
+        "within",
+        "text",
+    },
+    "if_exists": {
+        "id",
+        "action",
+        "timeout_ms",
+        "retry_count",
+        "selector",
+        "selectors",
+        "frame_selector",
+        "match",
+        "within",
+        "then_steps",
+        "else_steps",
+    },
+    "one_of": {"id", "action", "timeout_ms", "retry_count", "branches"},
     "screenshot": {"id", "action", "timeout_ms", "retry_count"},
 }
 _STEP_FIELDS_TO_SCAN = ("selector", "frame_selector", "text", "url", "save_as", "attr")
@@ -149,7 +191,7 @@ def validate_workflow(doc: WorkflowDocument) -> ValidationResult:
         issues.extend(
             _validate_step(
                 step,
-                index,
+                f"steps[{index}]",
                 step_ids,
                 declared_output_keys,
                 available_outputs,
@@ -168,13 +210,12 @@ def ensure_valid_workflow(doc: WorkflowDocument) -> WorkflowDocument:
 
 def _validate_step(
     step: WorkflowStep,
-    index: int,
+    path: str,
     step_ids: set[str],
     declared_output_keys: set[str],
     available_outputs: set[str],
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
-    path = f"steps[{index}]"
 
     if step.action not in ALLOWED_ACTIONS:
         issues.append(
@@ -228,7 +269,7 @@ def _validate_step(
             )
         )
 
-    if step.frame_selector is not None and step.action not in DOM_ACTIONS:
+    if step.frame_selector is not None and step.action not in _LOCATOR_ACTIONS:
         issues.append(
             ValidationIssue(
                 path=f"{path}.frame_selector",
@@ -239,8 +280,24 @@ def _validate_step(
             )
         )
 
-    if step.action in DOM_ACTIONS:
+    if step.within is not None and step.action not in _LOCATOR_ACTIONS:
+        issues.append(
+            ValidationIssue(
+                path=f"{path}.within",
+                message=f"within is not valid for action {step.action!r}.",
+            )
+        )
+
+    if step.action in _LOCATOR_ACTIONS:
         issues.extend(_validate_locator_fields(step, path))
+        if step.within is not None:
+            issues.extend(
+                _validate_locator(
+                    step.within,
+                    f"{path}.within",
+                    available_outputs=available_outputs,
+                )
+            )
 
     for field_name in _STEP_FIELDS_TO_SCAN:
         value = getattr(step, field_name)
@@ -261,6 +318,43 @@ def _validate_step(
                     available_outputs=available_outputs,
                 )
             )
+
+    if step.action == "if_exists":
+        if not step.then_steps:
+            issues.append(
+                ValidationIssue(path=f"{path}.then", message="then must contain at least one step.")
+            )
+    if step.action == "one_of" and not step.branches:
+        issues.append(
+            ValidationIssue(
+                path=f"{path}.branches",
+                message="branches must contain at least one branch.",
+            )
+        )
+
+    if step.then_steps or step.else_steps:
+        issues.extend(
+            _validate_exclusive_step_sets(
+                [
+                    ("then", step.then_steps or []),
+                    ("else", step.else_steps or []),
+                ],
+                path,
+                step_ids,
+                declared_output_keys,
+                available_outputs,
+            )
+        )
+    if step.branches:
+        issues.extend(
+            _validate_exclusive_branches(
+                step.branches,
+                path,
+                step_ids,
+                declared_output_keys,
+                available_outputs,
+            )
+        )
 
     if step.save_as:
         if step.save_as in declared_output_keys:
@@ -305,6 +399,212 @@ def _validate_locator_fields(step: WorkflowStep, path: str) -> list[ValidationIs
                         message="selectors entries cannot be empty.",
                     )
                 )
+
+    return issues
+
+
+def _validate_locator(
+    locator: WorkflowLocator,
+    path: str,
+    *,
+    available_outputs: set[str],
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    has_selector = locator.selector not in (None, "")
+    has_selectors = locator.selectors is not None and len(locator.selectors) > 0
+
+    if not has_selector and not has_selectors:
+        issues.append(
+            ValidationIssue(
+                path=f"{path}.selector",
+                message="At least one selector is required.",
+            )
+        )
+
+    if isinstance(locator.selector, str):
+        issues.extend(
+            _validate_interpolation(
+                locator.selector,
+                f"{path}.selector",
+                available_outputs=available_outputs,
+            )
+        )
+
+    if locator.selectors is not None:
+        if not locator.selectors:
+            issues.append(
+                ValidationIssue(
+                    path=f"{path}.selectors",
+                    message="selectors cannot be empty when provided.",
+                )
+            )
+        for selector_index, selector in enumerate(locator.selectors):
+            if selector == "":
+                issues.append(
+                    ValidationIssue(
+                        path=f"{path}.selectors[{selector_index}]",
+                        message="selectors entries cannot be empty.",
+                    )
+                )
+            issues.extend(
+                _validate_interpolation(
+                    selector,
+                    f"{path}.selectors[{selector_index}]",
+                    available_outputs=available_outputs,
+                )
+            )
+
+    return issues
+
+
+def _validate_branch(
+    branch: WorkflowBranch,
+    path: str,
+    step_ids: set[str],
+    declared_output_keys: set[str],
+    available_outputs: set[str],
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    has_selector = branch.selector not in (None, "")
+    has_selectors = branch.selectors is not None and len(branch.selectors) > 0
+    has_url_guard = branch.url not in (None, "")
+
+    if not branch.steps:
+        issues.append(
+            ValidationIssue(path=f"{path}.steps", message="steps must contain at least one step.")
+        )
+
+    if not branch.default and not has_url_guard and not has_selector and not has_selectors:
+        issues.append(
+            ValidationIssue(
+                path=path,
+                message="Each branch must define a guard or be marked default.",
+            )
+        )
+
+    if has_url_guard and isinstance(branch.url, str):
+        issues.extend(
+            _validate_interpolation(
+                branch.url,
+                f"{path}.url",
+                available_outputs=available_outputs,
+            )
+        )
+
+    if branch.frame_selector is not None and not (has_selector or has_selectors):
+        issues.append(
+            ValidationIssue(
+                path=f"{path}.frame_selector",
+                message="frame_selector requires a branch selector.",
+            )
+        )
+
+    if has_selector or has_selectors:
+        issues.extend(
+            _validate_locator(
+                WorkflowLocator(
+                    selector=branch.selector,
+                    selectors=branch.selectors,
+                    match=branch.match,
+                ),
+                path,
+                available_outputs=available_outputs,
+            )
+        )
+    if branch.within is not None:
+        issues.extend(
+            _validate_locator(
+                branch.within,
+                f"{path}.within",
+                available_outputs=available_outputs,
+            )
+        )
+
+    for nested_index, nested_step in enumerate(branch.steps):
+        issues.extend(
+            _validate_step(
+                nested_step,
+                f"{path}.steps[{nested_index}]",
+                step_ids,
+                declared_output_keys,
+                available_outputs,
+            )
+        )
+
+    return issues
+
+
+def _validate_exclusive_step_sets(
+    step_sets: list[tuple[str, list[WorkflowStep]]],
+    path: str,
+    step_ids: set[str],
+    declared_output_keys: set[str],
+    available_outputs: set[str],
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    base_declared_outputs = set(declared_output_keys)
+    base_available_outputs = set(available_outputs)
+    branch_declared_sets: list[set[str]] = []
+    branch_available_sets: list[set[str]] = []
+
+    for label, nested_steps in step_sets:
+        nested_declared = set(declared_output_keys)
+        nested_available = set(available_outputs)
+        for nested_index, nested_step in enumerate(nested_steps):
+            issues.extend(
+                _validate_step(
+                    nested_step,
+                    f"{path}.{label}[{nested_index}]",
+                    step_ids,
+                    nested_declared,
+                    nested_available,
+                )
+            )
+        branch_declared_sets.append(nested_declared)
+        branch_available_sets.append(nested_available)
+
+    for nested_declared in branch_declared_sets:
+        declared_output_keys.update(nested_declared - base_declared_outputs)
+    if branch_available_sets:
+        guaranteed_available = set.intersection(*branch_available_sets)
+        available_outputs.update(guaranteed_available - base_available_outputs)
+
+    return issues
+
+
+def _validate_exclusive_branches(
+    branches: list[WorkflowBranch],
+    path: str,
+    step_ids: set[str],
+    declared_output_keys: set[str],
+    available_outputs: set[str],
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    base_declared_outputs = set(declared_output_keys)
+    base_available_outputs = set(available_outputs)
+    branch_declared_sets: list[set[str]] = []
+    branch_available_sets: list[set[str]] = []
+
+    for branch_index, branch in enumerate(branches):
+        nested_declared = set(declared_output_keys)
+        nested_available = set(available_outputs)
+        issues.extend(
+            _validate_branch(
+                branch,
+                f"{path}.branches[{branch_index}]",
+                step_ids,
+                nested_declared,
+                nested_available,
+            )
+        )
+        branch_declared_sets.append(nested_declared)
+        branch_available_sets.append(nested_available)
+
+    for nested_declared in branch_declared_sets:
+        declared_output_keys.update(nested_declared - base_declared_outputs)
+    if branch_available_sets:
+        guaranteed_available = set.intersection(*branch_available_sets)
+        available_outputs.update(guaranteed_available - base_available_outputs)
 
     return issues
 

@@ -11,17 +11,27 @@ ALLOWED_ACTIONS = {
     "click",
     "type",
     "wait_for",
+    "wait_for_url_contains",
     "extract_text",
     "extract_attr",
     "assert_exists",
+    "assert_url_contains",
+    "assert_text_contains",
+    "if_exists",
+    "one_of",
     "screenshot",
 }
 
 READ_ONLY_ACTIONS = {
     "wait_for",
+    "wait_for_url_contains",
     "extract_text",
     "extract_attr",
     "assert_exists",
+    "assert_url_contains",
+    "assert_text_contains",
+    "if_exists",
+    "one_of",
     "screenshot",
 }
 
@@ -32,7 +42,30 @@ DOM_ACTIONS = {
     "extract_text",
     "extract_attr",
     "assert_exists",
+    "assert_text_contains",
 }
+
+
+class WorkflowLocator(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selector: str | None = None
+    selectors: list[str] | None = None
+    match: ElementMatch | None = None
+
+
+class WorkflowBranch(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    name: str | None = None
+    selector: str | None = None
+    selectors: list[str] | None = None
+    frame_selector: str | None = None
+    match: ElementMatch | None = None
+    within: WorkflowLocator | None = None
+    url: str | None = None
+    default: bool = False
+    steps: list[WorkflowStep]
 
 
 class WorkflowSettings(BaseModel):
@@ -45,7 +78,7 @@ class WorkflowSettings(BaseModel):
 
 
 class WorkflowStep(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     action: str
     id: str | None = None
@@ -55,10 +88,14 @@ class WorkflowStep(BaseModel):
     selectors: list[str] | None = None
     frame_selector: str | None = None
     match: ElementMatch | None = None
+    within: WorkflowLocator | None = None
     text: str | None = None
     url: str | None = None
     save_as: str | None = None
     attr: str | None = None
+    then_steps: list[WorkflowStep] | None = Field(default=None, alias="then")
+    else_steps: list[WorkflowStep] | None = Field(default=None, alias="else")
+    branches: list[WorkflowBranch] | None = None
 
 
 class WorkflowDocument(BaseModel):
@@ -69,3 +106,7 @@ class WorkflowDocument(BaseModel):
     vars: dict[str, Any] = Field(default_factory=dict)
     secrets: dict[str, Any] = Field(default_factory=dict)
     steps: list[WorkflowStep]
+
+
+WorkflowBranch.model_rebuild()
+WorkflowStep.model_rebuild()

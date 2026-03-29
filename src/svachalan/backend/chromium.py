@@ -16,6 +16,7 @@ from svachalan.contracts.backend import (
     BrowserSession,
     ElementTarget,
     NavigationOptions,
+    PageState,
     ScreenshotOptions,
     TypeOptions,
 )
@@ -129,6 +130,37 @@ class ChromiumBackend:
         artifact = ArtifactRef(path=str(output_path), label=label)
         return ActionResult.success(value=artifact)
 
+    def inspect_page(self, opts: ActionOptions | None = None) -> ActionResult:
+        timeout_seconds = _timeout_seconds(opts)
+        try:
+            payload = self._evaluate(
+                _build_page_state_expression(),
+                timeout_seconds=timeout_seconds,
+            )
+        except TimeoutError:
+            return _failure(ErrorCode.TIMEOUT, "Timed out inspecting page state.")
+        except _CDPError as exc:
+            return _failure(ErrorCode.PROTOCOL_ERROR, str(exc))
+
+        if not isinstance(payload, dict):
+            return _failure(
+                ErrorCode.PROTOCOL_ERROR,
+                "Page inspection returned an invalid response.",
+            )
+        try:
+            page_state = PageState.model_validate(payload)
+        except Exception as exc:  # pragma: no cover - defensive shape guard
+            return _failure(ErrorCode.PROTOCOL_ERROR, f"Invalid page state payload: {exc}")
+        return ActionResult.success(
+            page_state,
+            details={
+                "current_url": page_state.url,
+                "page_title": page_state.title,
+                "detected_indicators": page_state.detected_indicators,
+                "handoff_required": page_state.handoff_required,
+            },
+        )
+
     def _execute_dom_action(
         self,
         target: ElementTarget,
@@ -155,7 +187,10 @@ class ChromiumBackend:
         if not isinstance(payload, dict):
             return _failure(ErrorCode.PROTOCOL_ERROR, "DOM action returned an invalid response.")
         if payload.get("ok") is True:
-            return ActionResult.success(payload.get("value"))
+            details = payload.get("details", {})
+            if not isinstance(details, dict):
+                details = {}
+            return ActionResult.success(payload.get("value"), details=details)
 
         error = payload.get("error")
         if not isinstance(error, dict):
@@ -163,9 +198,15 @@ class ChromiumBackend:
                 ErrorCode.PROTOCOL_ERROR,
                 "DOM action returned an invalid error payload.",
             )
+        error_details = error.get("details") if isinstance(error.get("details"), dict) else None
         try:
             return ActionResult.failure(
-                ActionError(code=ErrorCode(error["code"]), message=str(error["message"]))
+                ActionError(
+                    code=ErrorCode(error["code"]),
+                    message=str(error["message"]),
+                    details=error_details,
+                ),
+                details=error_details,
             )
         except (KeyError, ValueError):
             return _failure(ErrorCode.PROTOCOL_ERROR, "DOM action returned an unknown error code.")
@@ -190,7 +231,12 @@ class ChromiumBackend:
 
 class _CDPConnection:
     def __init__(self, ws_endpoint: str):
-        self._socket = connect(ws_endpoint, open_timeout=10, close_timeout=5)
+        self._socket = connect(
+            ws_endpoint,
+            open_timeout=10,
+            close_timeout=5,
+            max_size=None,
+        )
         self._next_id = 0
         self._events: list[dict[str, Any]] = []
 
@@ -265,9 +311,7 @@ def _build_dom_expression(
 ) -> str:
     payload = json.dumps(
         {
-            "selectors": target.all_selectors(),
-            "frameSelector": target.frame_selector,
-            "match": target.match,
+            "target": target.model_dump(mode="json", exclude_none=True),
             "action": action,
             "text": text,
             "attr": attr,
@@ -279,18 +323,31 @@ def _build_dom_expression(
   const fail = (code, message) => ({{ ok: false, error: {{ code, message }} }});
   const succeed = (value = null) => ({{ ok: true, value }});
 
-  const resolveRoot = () => {{
-    if (!args.frameSelector) {{
+  const selectorsFor = (locator) => {{
+    const selectors = [];
+    if (locator.selector) {{
+      selectors.push(locator.selector);
+    }}
+    if (Array.isArray(locator.selectors)) {{
+      selectors.push(...locator.selectors);
+    }}
+    return selectors;
+  }};
+
+  const describeSelectors = (selectors) => selectors.join(", ");
+
+  const resolveRoot = (frameSelector) => {{
+    if (!frameSelector) {{
       return {{ root: document }};
     }}
-    const frames = document.querySelectorAll(args.frameSelector);
+    const frames = document.querySelectorAll(frameSelector);
     if (frames.length === 0) {{
-      return fail("selector_not_found", `Frame selector ${{args.frameSelector}} was not found.`);
+      return fail("selector_not_found", `Frame selector ${{frameSelector}} was not found.`);
     }}
     if (frames.length > 1) {{
       return fail(
         "selector_not_unique",
-        `Frame selector ${{args.frameSelector}} matched multiple elements.`,
+        `Frame selector ${{frameSelector}} matched multiple elements.`,
       );
     }}
     const frame = frames[0];
@@ -308,19 +365,25 @@ def _build_dom_expression(
     }}
   }};
 
-  const describeSelectors = () => args.selectors.join(", ");
-
-  const resolveElement = (root) => {{
+  const resolveElement = (root, locator) => {{
+    if (locator.within) {{
+      const scopeResult = resolveElement(root, locator.within);
+      if (scopeResult.ok === false) {{
+        return scopeResult;
+      }}
+      root = scopeResult.element;
+    }}
+    const selectors = selectorsFor(locator);
     let nonUniqueSelector = null;
-    for (const selector of args.selectors) {{
+    for (const selector of selectors) {{
       const matches = Array.from(root.querySelectorAll(selector));
       if (matches.length === 0) {{
         continue;
       }}
-      if (args.match === "first_visible") {{
+      if (locator.match === "first_visible") {{
         const visibleMatch = matches.find((match) => isVisible(match));
         if (visibleMatch) {{
-          return {{ element: visibleMatch, selector }};
+          return {{ element: visibleMatch, selector, attemptedSelectors: selectors }};
         }}
         continue;
       }}
@@ -328,15 +391,26 @@ def _build_dom_expression(
         nonUniqueSelector = selector;
         continue;
       }}
-      return {{ element: matches[0], selector }};
+      return {{ element: matches[0], selector, attemptedSelectors: selectors }};
     }}
     if (nonUniqueSelector) {{
-      return fail(
-        "selector_not_unique",
-        `Selector ${{nonUniqueSelector}} matched multiple elements.`,
-      );
+      return {{
+        ok: false,
+        error: {{
+          code: "selector_not_unique",
+          message: `Selector ${{nonUniqueSelector}} matched multiple elements.`,
+          details: {{ attempted_selectors: selectors }},
+        }},
+      }};
     }}
-    return fail("selector_not_found", `No selectors matched: ${{describeSelectors()}}.`);
+    return {{
+      ok: false,
+      error: {{
+        code: "selector_not_found",
+        message: `No selectors matched: ${{describeSelectors(selectors)}}.`,
+        details: {{ attempted_selectors: selectors }},
+      }},
+    }};
   }};
 
   const isVisible = (element) => {{
@@ -352,12 +426,12 @@ def _build_dom_expression(
 
   const isEnabled = (element) => !("disabled" in element) || !element.disabled;
 
-  const rootResult = resolveRoot();
+  const rootResult = resolveRoot(args.target.frameSelector);
   if (rootResult.ok === false) {{
     return rootResult;
   }}
 
-  const elementResult = resolveElement(rootResult.root);
+  const elementResult = resolveElement(rootResult.root, args.target);
   if (elementResult.ok === false) {{
     return elementResult;
   }}
@@ -365,24 +439,60 @@ def _build_dom_expression(
   const element = elementResult.element;
   const matchedSelector = elementResult.selector;
   if (args.action === "exists") {{
-    return succeed();
+    return {{
+      ok: true,
+      value: null,
+      details: {{
+        matched_selector: matchedSelector,
+        attempted_selectors: elementResult.attemptedSelectors,
+      }},
+    }};
   }}
   if (args.action === "extract_text") {{
-    return succeed(
-      typeof element.innerText === "string"
+    return {{
+      ok: true,
+      value: typeof element.innerText === "string"
         ? element.innerText
-        : (element.textContent ?? "")
-    );
+        : (element.textContent ?? ""),
+      details: {{
+        matched_selector: matchedSelector,
+        attempted_selectors: elementResult.attemptedSelectors,
+      }},
+    }};
   }}
   if (args.action === "extract_attr") {{
-    return succeed(element.getAttribute(args.attr));
+    return {{
+      ok: true,
+      value: element.getAttribute(args.attr),
+      details: {{
+        matched_selector: matchedSelector,
+        attempted_selectors: elementResult.attemptedSelectors,
+      }},
+    }};
   }}
   if (!isVisible(element) || !isEnabled(element)) {{
-    return fail("element_not_interactable", `Selector ${{matchedSelector}} is not interactable.`);
+    return {{
+      ok: false,
+      error: {{
+        code: "element_not_interactable",
+        message: `Selector ${{matchedSelector}} is not interactable.`,
+        details: {{
+          matched_selector: matchedSelector,
+          attempted_selectors: elementResult.attemptedSelectors,
+        }},
+      }},
+    }};
   }}
   if (args.action === "click") {{
     element.click();
-    return succeed();
+    return {{
+      ok: true,
+      value: null,
+      details: {{
+        matched_selector: matchedSelector,
+        attempted_selectors: elementResult.attemptedSelectors,
+      }},
+    }};
   }}
   if (args.action === "type") {{
     if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {{
@@ -390,18 +500,39 @@ def _build_dom_expression(
       element.value = args.text ?? "";
       element.dispatchEvent(new Event("input", {{ bubbles: true }}));
       element.dispatchEvent(new Event("change", {{ bubbles: true }}));
-      return succeed();
+      return {{
+        ok: true,
+        value: null,
+        details: {{
+          matched_selector: matchedSelector,
+          attempted_selectors: elementResult.attemptedSelectors,
+        }},
+      }};
     }}
     if (element.isContentEditable) {{
       element.focus();
       element.textContent = args.text ?? "";
       element.dispatchEvent(new Event("input", {{ bubbles: true }}));
-      return succeed();
+      return {{
+        ok: true,
+        value: null,
+        details: {{
+          matched_selector: matchedSelector,
+          attempted_selectors: elementResult.attemptedSelectors,
+        }},
+      }};
     }}
-    return fail(
-      "element_not_interactable",
-      `Selector ${{matchedSelector}} is not a typable element.`,
-    );
+    return {{
+      ok: false,
+      error: {{
+        code: "element_not_interactable",
+        message: `Selector ${{matchedSelector}} is not a typable element.`,
+        details: {{
+          matched_selector: matchedSelector,
+          attempted_selectors: elementResult.attemptedSelectors,
+        }},
+      }},
+    }};
   }}
   return fail("protocol_error", `Unsupported DOM action ${{args.action}}.`);
 }})()
@@ -414,6 +545,69 @@ def _failure(code: ErrorCode, message: str) -> ActionResult:
 
 def _target_description(target: ElementTarget) -> str:
     return ", ".join(target.all_selectors())
+
+
+def _build_page_state_expression() -> str:
+    return """
+(() => {
+  const text = document.body?.innerText ?? "";
+  const normalizedText = text.toLowerCase();
+  const title = document.title ?? "";
+  const normalizedTitle = title.toLowerCase();
+  const indicators = [];
+  let handoffReason = null;
+
+  const hasCaptcha =
+    normalizedText.includes("captcha") ||
+    normalizedText.includes("enter the characters you see below") ||
+    document.querySelector("#captchacharacters, iframe[src*='captcha']") !== null;
+  if (hasCaptcha) {
+    indicators.push("captcha");
+    handoffReason = handoffReason ?? "Captcha or bot challenge detected.";
+  }
+
+  const hasPasswordField = document.querySelector("input[type='password']") !== null;
+  const signInLanguage =
+    normalizedText.includes("sign in") ||
+    normalizedText.includes("log in") ||
+    normalizedTitle.includes("sign in") ||
+    normalizedTitle.includes("log in");
+  if (hasPasswordField && signInLanguage) {
+    indicators.push("login");
+    handoffReason = handoffReason ?? "Login page detected.";
+  }
+
+    const otpSelector =
+      "input[autocomplete='one-time-code'], input[name*='otp'], input[name*='code']";
+  const hasOtp =
+    document.querySelector(otpSelector) !== null ||
+    normalizedText.includes("verification code") ||
+    normalizedText.includes("two-step verification") ||
+    normalizedText.includes("one-time passcode");
+  if (hasOtp) {
+    indicators.push("2fa");
+    handoffReason = handoffReason ?? "Verification or 2FA challenge detected.";
+  }
+
+  const hasSecurityCheck =
+    normalizedText.includes("security check") ||
+    normalizedText.includes("verify you are human");
+  if (hasSecurityCheck) {
+    indicators.push("security_check");
+    handoffReason = handoffReason ?? "Security verification detected.";
+  }
+
+  return {
+    url: window.location.href,
+    title: document.title ?? null,
+    html: document.documentElement.outerHTML,
+    text,
+    handoff_required: handoffReason !== null,
+    handoff_reason: handoffReason,
+    detected_indicators: indicators,
+  };
+})()
+""".strip()
 
 
 def _timeout_seconds(opts: ActionOptions | None) -> float:

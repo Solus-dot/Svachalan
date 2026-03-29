@@ -33,6 +33,7 @@ class StepResult(BaseModel):
     output: Any | None = None
     error: ActionError | None = None
     artifacts: list[ArtifactRef] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
 
 
 class RunOptions(BaseModel):
@@ -59,5 +60,6 @@ class RunReport(BaseModel):
     steps: list[StepResult] = Field(default_factory=list)
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     error: ActionError | None = None
+    handoff_required: bool = False
+    handoff_reason: str | None = None
     report_path: str | None = None
-

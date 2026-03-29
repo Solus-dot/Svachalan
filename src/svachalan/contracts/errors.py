@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -16,6 +17,9 @@ class ErrorCode(StrEnum):
     PROTOCOL_ERROR = "protocol_error"
     UNSUPPORTED_SCOPE = "unsupported_scope"
     INTERPOLATION_ERROR = "interpolation_error"
+    ASSERTION_FAILED = "assertion_failed"
+    NO_BRANCH_MATCHED = "no_branch_matched"
+    HUMAN_HANDOFF_REQUIRED = "human_handoff_required"
 
 
 class ActionError(BaseModel):
@@ -23,6 +27,7 @@ class ActionError(BaseModel):
 
     code: ErrorCode
     message: str
+    details: dict[str, Any] | None = None
 
 
 class ValidationIssue(BaseModel):
